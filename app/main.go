@@ -4,22 +4,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
+	"strings"
 	"syscall"
-	"time"
 )
 
-var registry = "https://registry-1.docker.io/v2/library"
+const registryApiBaseURL = "https://registry-1.docker.io"
 
-type apiTOKEN struct {
-	Token       string    `json:"token"`
-	AccessToken string    `json:"access_token"`
-	ExpiresIn   int       `json:"expires_in"`
-	IssuedAt    time.Time `json:"issued_at"`
+type nullReader struct{}
+
+func (nullReader) Read(p []byte) (n int, err error) { return len(p), nil }
+
+type FsLayer struct {
+	BlobSum string `json:"blobSum"`
 }
 
 type Manifest struct {
@@ -28,178 +30,163 @@ type Manifest struct {
 	FsLayers []FsLayer `json:"fsLayers"`
 }
 
-type FsLayer struct {
-	BlobSum string `json:"blobSum"`
-}
-
-// Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
-func main() {
-	// get the command and its arguments
-	image := os.Args[2]
-	command := os.Args[3]
-	args := os.Args[4:len(os.Args)]
-
-	// isolate file system
-	chrootDir := isolateFileSystem(command)
-
-	// pull and deal with docker image
-	pullDockerImage(image, chrootDir)
-
-	// exec the command with chroot
-	cmd := exec.Command(command, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	// isolate the process; learn more https://youtu.be/sK5i-N34im8
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWPID,
-	}
-
-	// run the command
-	err := cmd.Run()
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
-			exitCode := exitError.ProcessState.ExitCode()
-			os.Exit(exitCode)
-		} else {
-			os.Exit(1)
-		}
-	}
-}
-
-func isolateFileSystem(command string) string {
-	// create a chroot directory
-	chrootDir, err := os.MkdirTemp("", "")
-	if err != nil {
-		fmt.Printf("error creating chroot dir: %v", err)
-		os.Exit(1)
-	}
-
-	if err = copyExecutableIntoDir(chrootDir, command); err != nil {
-		fmt.Printf("error copying executable into chroot dir: %v", err)
-		os.Exit(1)
-	}
-
-	// Create /dev/null so that cmd.Run() doesn't complain;
-	// here is an explanation https://rohitpaulk.com/articles/cmd-run-dev-null
-	if err = createDevNull(chrootDir); err != nil {
-		fmt.Printf("error creating /dev/null: %v", err)
-		os.Exit(1)
-	}
-
-	// using chroot syscall on the chrootDir
-	if err = syscall.Chroot(chrootDir); err != nil {
-		fmt.Printf("chroot err: %v", err)
-		os.Exit(1)
-	}
-	return chrootDir
-}
-
-func pullDockerImage(image, chrootDir string) {
-	// authenticate with docker.io
-	token, err := getBearerToken(image)
-	if err != nil {
-		fmt.Printf("error getting token: %v", err)
-		os.Exit(1)
-	}
-
-	manifest, err := fetchManifest(token, image)
-	if err != nil {
-		fmt.Printf("error fetching manifest: %v", err)
-		os.Exit(1)
-	}
-
-	if err := extractImage(chrootDir, token, image, manifest); err != nil {
-		fmt.Printf("error extracting image: %v", err)
-		os.Exit(1)
-	}
-}
-
-// executablePath => /usr/local/bin/docker-explorer
-// chrootDir => /tmp/*
-func copyExecutableIntoDir(chrootDir string, executablePath string) error {
-	executablePathInChrootDir := path.Join(chrootDir, executablePath)
-
-	if err := os.MkdirAll(path.Dir(executablePathInChrootDir), 0750); err != nil {
+func copyBinary(rootDir string, binPath string) error {
+	if err := os.MkdirAll(filepath.Join(rootDir, filepath.Dir(binPath)), os.ModePerm); err != nil {
 		return err
 	}
 
-	return copyFile(executablePath, executablePathInChrootDir)
-}
-
-func copyFile(sourceFilePath, destinationFilePath string) error {
-	sourceFileStat, err := os.Stat(sourceFilePath)
+	dstFd, err := os.OpenFile(filepath.Join(rootDir, binPath), os.O_RDWR|os.O_CREATE, 0777)
 	if err != nil {
 		return err
 	}
+	defer dstFd.Close()
 
-	sourceFile, err := os.Open(sourceFilePath)
+	srcFd, err := os.Open(binPath)
 	if err != nil {
 		return err
 	}
-	defer sourceFile.Close()
+	defer srcFd.Close()
 
-	destinationFile, err := os.OpenFile(destinationFilePath, os.O_RDWR|os.O_CREATE, sourceFileStat.Mode())
-	if err != nil {
+	if _, err := io.Copy(dstFd, srcFd); err != nil {
 		return err
 	}
-	defer destinationFile.Close()
 
-	_, err = io.Copy(destinationFile, sourceFile)
-	return err
+	return nil
 }
 
-func createDevNull(chrootDir string) error {
-	if err := os.Mkdir(path.Join(chrootDir, "dev"), os.ModePerm); err != nil {
+func chroot(rootfs string, binPath string) error {
+	if err := os.Chdir(rootfs); err != nil {
 		return err
 	}
-	return os.WriteFile(path.Join(chrootDir, "dev", "null"), []byte{}, 0644)
+
+	if err := syscall.Chroot(rootfs); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func getBearerToken(repository string) (string, error) {
-	var apiResponse apiTOKEN
-
-	service := "registry.docker.io"
-
-	response, err := http.Get(fmt.Sprintf(`https://auth.docker.io/token?service=%s&scope=repository:library/%s:pull`, service, repository))
+func fetchToken(name string) (string, error) {
+	u, err := url.Parse("https://auth.docker.io/token")
 	if err != nil {
-		return "", fmt.Errorf("failed to call https://auth.docker.io/token: %w", err)
+		return "", err
 	}
-	defer response.Body.Close()
 
-	body, err := ioutil.ReadAll(response.Body)
+	params := url.Values{}
+	params.Add("scope", fmt.Sprintf("repository:library/%s:pull", name))
+	params.Add("service", "registry.docker.io")
+
+	u.RawQuery = params.Encode()
+
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to read http response body: %w", err)
+		return "", err
 	}
 
-	if err := json.Unmarshal(body, &apiResponse); err != nil {
-		return "", fmt.Errorf("failed to parse http response: %w", err)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	var auth struct {
+		Token string
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&auth); err != nil {
+		return "", err
 	}
 
-	return apiResponse.Token, nil
+	return auth.Token, nil
 }
-func fetchManifest(token string, image string) (*Manifest, error) {
-	imageManifestURL := fmt.Sprintf("%s/%s/manifests/latest", registry, image)
-	imageManifestReq, _ := http.NewRequest("GET", imageManifestURL, nil)
-	imageManifestReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
-	imageManifestReq.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v1json")
-	imageManifestRes, err := http.DefaultClient.Do(imageManifestReq)
-	if err != nil {
-		return nil, err
-	}
-	defer imageManifestRes.Body.Close()
-	body, err := ioutil.ReadAll(imageManifestRes.Body)
+
+func fetchManifest(name string, token string) (*Manifest, error) {
+	u, err := url.JoinPath(registryApiBaseURL, "v2", "library", name, "manifests", "latest")
 	if err != nil {
 		return nil, err
 	}
 
-	var manifest Manifest
-	return &manifest, json.Unmarshal(body, &manifest)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v1json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var manifest *Manifest
+	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+		return nil, err
+	}
+
+	return manifest, nil
 }
 
-func extractImage(rootDir, token, repository string, manifest *Manifest) error {
-	for index, digest := range manifest.FsLayers {
-		if err := fetchLayer(rootDir, token, repository, digest, index); err != nil {
+func pullLayer(rootfs string, name string, digest string, token string) error {
+	u, err := url.JoinPath(registryApiBaseURL, "v2", "library", name, "blobs", digest)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	tarName := filepath.Join(rootfs, fmt.Sprintf("%s.tar.gz", digest))
+	tarFd, err := os.OpenFile(
+		tarName,
+		os.O_RDWR|os.O_CREATE,
+		0777,
+	)
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(tarFd, resp.Body); err != nil {
+		tarFd.Close()
+		return err
+	}
+	tarFd.Close()
+
+	cmd := exec.Command("tar", "-xzf", tarName, "-C", rootfs)
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	if err := os.Remove(tarName); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func pullImage(rootfs string, name string) error {
+	token, err := fetchToken(name)
+	if err != nil {
+		return err
+	}
+
+	manifest, err := fetchManifest(name, token)
+	if err != nil {
+		return err
+	}
+
+	for _, fsLayer := range manifest.FsLayers {
+		if err := pullLayer(rootfs, name, fsLayer.BlobSum, token); err != nil {
 			return err
 		}
 	}
@@ -207,51 +194,45 @@ func extractImage(rootDir, token, repository string, manifest *Manifest) error {
 	return nil
 }
 
-func fetchLayer(rootDir, token, repository string, fsLayer FsLayer, index int) error {
-	var response *http.Response
-
-	url := fmt.Sprintf("%s/%s/blobs/%s", registry, repository, fsLayer.BlobSum)
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+// Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
+func main() {
+	tmpDir, err := os.MkdirTemp("", "jail")
 	if err != nil {
-		return fmt.Errorf("failed to read http response body: %w", err)
+		log.Fatalln(err)
 	}
-	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", token))
+	defer os.RemoveAll(tmpDir)
 
-	response, err = http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to read http response body: %w", err)
-	}
-	defer response.Body.Close()
-
-	// Temporary Redirect
-	if response.StatusCode == 307 {
-		redirectUrl := response.Header.Get("location")
-		req, err := http.NewRequest(http.MethodGet, redirectUrl, nil)
-		if err != nil {
-			return fmt.Errorf("failed to read http response body: %w", err)
-		}
-		req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", token))
-
-		response, err = http.DefaultClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to read http response body: %w", err)
-		}
-		defer response.Body.Close()
+	image := os.Args[2]
+	var imageName string
+	if strings.Contains(image, ":") {
+		imageName = strings.Split(image, ":")[0]
+	} else {
+		imageName = image
 	}
 
-	data, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return err
+	command := os.Args[3]
+	if err := copyBinary(tmpDir, command); err != nil {
+		log.Fatalln(err)
 	}
 
-	tarball := fmt.Sprintf("%s.tar", fsLayer.BlobSum)
-	if err := ioutil.WriteFile(tarball, data, 0644); err != nil {
-		return err
+	if err := pullImage(tmpDir, imageName); err != nil {
+		log.Fatalln(err)
 	}
-	defer os.Remove(tarball)
+	args := os.Args[4:len(os.Args)]
 
-	cmd := exec.Command("tar", "xpf", tarball, "-C", rootDir)
+	// create a chroot directory
+	if err := chroot(tmpDir, command); err != nil {
+		log.Fatalln(err)
+	}
+
+	cmd := exec.Command(command, args...)
+	cmd.Stdin = nullReader{}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWPID,
+	}
+	if err := cmd.Run(); err != nil {
+		os.Exit(cmd.ProcessState.ExitCode())
+	}
 }
